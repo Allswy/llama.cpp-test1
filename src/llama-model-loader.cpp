@@ -629,8 +629,6 @@ llama_model_loader::llama_model_loader(
             } else {
                 fprintf(stderr, "Warning: Tensor %s not found in metadata!\n", tensor_name.c_str());
             }
-            //printf("size of tensor %s: %zu bytes\n", tensor_name.c_str(), ggml_nbytes(cur));
-            g_my_layer_table[layer_id].total_bytes_needed += ggml_nbytes(cur);
         }
         uint16_t n_split = 0;
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
@@ -736,9 +734,6 @@ llama_model_loader::llama_model_loader(
                     } else {
                         fprintf(stderr, "Warning: Tensor %s not found in metadata!\n", tensor_name.c_str());
                     }
-                    //printf("size of tensor %s: %zu bytes\n", tensor_name.c_str(), ggml_nbytes(cur));
-                    g_my_layer_table[layer_id].total_bytes_needed += ggml_nbytes(cur);
-
                 }
             }
 
@@ -821,8 +816,6 @@ llama_model_loader::llama_model_loader(
             } else {
                 fprintf(stderr, "Warning: Tensor %s not found in metadata!\n", tensor_name.c_str());
             }
-            //printf("size of tensor %s: %zu bytes\n", tensor_name.c_str(), ggml_nbytes(cur));
-            g_my_layer_table[layer_id].total_bytes_needed += ggml_nbytes(cur);
         }
     } else {
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);

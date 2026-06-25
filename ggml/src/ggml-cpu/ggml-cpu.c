@@ -53,11 +53,43 @@
 #endif
 
 //获取下一层
+static int get_first_initialized_block_after(int current_layer) {
+    for (int i = current_layer + 1; i < MAX_LAYERS; ++i) {
+        if (i == 900 || i == 998 || i == 999 || i == 1000) {
+            continue;
+        }
+        if (g_my_layer_table[i].is_initialized) {
+            return i;
+        }
+    }
+    return -999;
+}
+
 int get_next_layer(int current_layer) {
-    if (current_layer == 998) return 0;                             
-    if (current_layer >= 0 && current_layer < 27) return current_layer + 1; 
-    if (current_layer == 27) return 999;                            
-    return -999;                                                    
+    if (current_layer == 998) {
+        int next_block = get_first_initialized_block_after(-1);
+        if (next_block != -999) {
+            return next_block;
+        }
+    } else if (current_layer >= 0 && current_layer < MAX_LAYERS) {
+        int next_block = get_first_initialized_block_after(current_layer);
+        if (next_block != -999) {
+            return next_block;
+        }
+    } else {
+        return -999;
+    }
+
+    if (current_layer == 999) {
+        return -999;
+    }
+    if (current_layer != 1000 && g_my_layer_table[1000].is_initialized) {
+        return 1000;
+    }
+    if (current_layer != 999 && g_my_layer_table[999].is_initialized) {
+        return 999;
+    }
+    return -999;
 }
 
 // 按需读取文件到Buffer
