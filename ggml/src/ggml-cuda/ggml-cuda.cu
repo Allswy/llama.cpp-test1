@@ -141,15 +141,16 @@ extern "C" {
 }
 
 // GPU I/O Sync primitives (C++ only, static file scope)
-static std::thread * g_gpu_io_thread = nullptr;
+[[maybe_unused]] static std::thread * g_gpu_io_thread = nullptr;
 static std::mutex g_gpu_io_mutex;
 static std::condition_variable g_gpu_cv_worker;
 static std::condition_variable g_gpu_cv_main;
 static int g_gpu_prefetch_target = -999;
-static int g_gpu_prefetch_done   = -999;
+[[maybe_unused]] static int g_gpu_prefetch_done   = -999;
 static std::atomic<bool> g_gpu_io_shutdown{false};
 static int g_gpu_currently_loaded = -999;
 static void * g_gpu_staging_buffer = nullptr;  // pinned CPU memory for disk→GPU transfer
+static int g_gpu_layer_device = 0;
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
@@ -201,10 +202,15 @@ static size_t get_max_gpu_layer_size() {
 static void init_gpu_layer_buffer(void *& buf, size_t size, int device) {
     if (buf != nullptr) return;
     CUDA_CHECK(ggml_cuda_device_malloc(&buf, size, device));
+    CUDA_CHECK(cudaMemset(buf, 0, 1));
+    CUDA_CHECK(cudaMemset((char *) buf + size - 1, 0, 1));
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // GPU I/O Worker thread: reads layer from disk to staging, uploads to GPU via cudaMemcpyAsync
-static void gpu_io_worker_func() {
+[[maybe_unused]] static void gpu_io_worker_func() {
+    ggml_cuda_set_device(g_gpu_layer_device);
+
     // Allocate pinned staging buffer for fast PCIe transfer
     cudaError_t err = cudaMallocHost(&g_gpu_staging_buffer, g_gpu_layer_buffer_size);
     if (err != cudaSuccess) {
@@ -212,6 +218,10 @@ static void gpu_io_worker_func() {
         (void)cudaGetLastError();
         g_gpu_staging_buffer = malloc(g_gpu_layer_buffer_size);
     }
+    if (g_gpu_staging_buffer == nullptr) {
+        GGML_ABORT("failed to allocate GPU staging buffer of size %zu\n", g_gpu_layer_buffer_size);
+    }
+    memset(g_gpu_staging_buffer, 0, g_gpu_layer_buffer_size);
 
     // Dedicated CUDA stream for async copy
     cudaStream_t copy_stream;
@@ -238,25 +248,35 @@ static void gpu_io_worker_func() {
                 TensorLocation * loc = &info->tensors[i];
                 offset = (offset + 31) & ~31;  // 32-byte alignment
 
+                if (offset + loc->n_bytes > g_gpu_layer_buffer_size) {
+                    GGML_ABORT("GPU layer buffer overflow at layer %d, tensor %d (%s): need %zu, buffer %zu\n",
+                               target, i, loc->name, offset + (size_t) loc->n_bytes, g_gpu_layer_buffer_size);
+                }
+
                 void * staging_addr = (char*)g_gpu_staging_buffer + offset;
 
                 // Read from disk to staging buffer
 #ifdef _WIN32
                 _fseeki64(g_model_file, loc->absolute_file_offset, SEEK_SET);
-                fread(staging_addr, 1, loc->n_bytes, g_model_file);
+                size_t n_read = fread(staging_addr, 1, loc->n_bytes, g_model_file);
+                if (n_read != loc->n_bytes) {
+                    GGML_ABORT("failed to read tensor %s for layer %d: read %zu of %" PRIu64 " bytes\n",
+                               loc->name, target, n_read, loc->n_bytes);
+                }
 #else
-                pread(fileno(g_model_file), staging_addr,
-                      loc->n_bytes, loc->absolute_file_offset);
+                ssize_t n_read = pread(fileno(g_model_file), staging_addr,
+                                       loc->n_bytes, loc->absolute_file_offset);
+                if (n_read < 0 || (uint64_t) n_read != loc->n_bytes) {
+                    GGML_ABORT("failed to read tensor %s for layer %d: read %zd of %" PRIu64 " bytes\n",
+                               loc->name, target, n_read, loc->n_bytes);
+                }
 #endif
                 // Record GPU address for this tensor
                 loc->cached_gpu_addr = (char*)g_gpu_io_ptr + offset;
+                CUDA_CHECK(cudaMemcpy(loc->cached_gpu_addr, staging_addr,
+                                      loc->n_bytes, cudaMemcpyHostToDevice));
                 offset += loc->n_bytes;
             }
-
-            // Async upload entire layer to GPU
-            CUDA_CHECK(cudaMemcpyAsync(g_gpu_io_ptr, g_gpu_staging_buffer,
-                           offset, cudaMemcpyHostToDevice, copy_stream));
-            CUDA_CHECK(cudaStreamSynchronize(copy_stream));
         }
 
         lock.lock();
@@ -270,43 +290,71 @@ static void gpu_io_worker_func() {
     CUDA_CHECK(cudaStreamDestroy(copy_stream));
 }
 
+static void load_gpu_layer_sync(int target, void * dst_base) {
+    if (target < 0 || target >= MAX_LAYERS || !g_my_layer_table[target].is_initialized) {
+        return;
+    }
+
+    ggml_cuda_set_device(g_gpu_layer_device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    static void * sync_staging_buffer = nullptr;
+    if (sync_staging_buffer == nullptr) {
+        sync_staging_buffer = malloc(g_gpu_layer_buffer_size);
+        if (sync_staging_buffer == nullptr) {
+            GGML_ABORT("failed to allocate sync GPU staging buffer of size %zu\n", g_gpu_layer_buffer_size);
+        }
+    }
+
+    LayerDiskInfo * info = &g_my_layer_table[target];
+    size_t offset = 0;
+
+    for (int i = 0; i < info->tensor_count; i++) {
+        TensorLocation * loc = &info->tensors[i];
+        offset = (offset + 31) & ~31;
+
+        if (offset + loc->n_bytes > g_gpu_layer_buffer_size) {
+            GGML_ABORT("GPU layer buffer overflow at layer %d, tensor %d (%s): need %zu, buffer %zu\n",
+                       target, i, loc->name, offset + (size_t) loc->n_bytes, g_gpu_layer_buffer_size);
+        }
+
+        void * staging_addr = (char *) sync_staging_buffer + offset;
+
+#ifdef _WIN32
+        _fseeki64(g_model_file, loc->absolute_file_offset, SEEK_SET);
+        size_t n_read = fread(staging_addr, 1, loc->n_bytes, g_model_file);
+        if (n_read != loc->n_bytes) {
+            GGML_ABORT("failed to read tensor %s for layer %d: read %zu of %" PRIu64 " bytes\n",
+                       loc->name, target, n_read, loc->n_bytes);
+        }
+#else
+        ssize_t n_read = pread(fileno(g_model_file), staging_addr,
+                               loc->n_bytes, loc->absolute_file_offset);
+        if (n_read < 0 || (uint64_t) n_read != loc->n_bytes) {
+            GGML_ABORT("failed to read tensor %s for layer %d: read %zd of %" PRIu64 " bytes\n",
+                       loc->name, target, n_read, loc->n_bytes);
+        }
+#endif
+
+        loc->cached_gpu_addr = (char *) dst_base + offset;
+        CUDA_CHECK(cudaMemcpy(loc->cached_gpu_addr, staging_addr,
+                              loc->n_bytes, cudaMemcpyHostToDevice));
+        offset += loc->n_bytes;
+    }
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 // Ensure the given layer is loaded into the GPU compute buffer.
 // Blocks if the layer is not yet loaded, swaps ping-pong buffers when ready.
 extern "C" void ensure_gpu_layer_loaded(int target_layer, int next_layer_hint) {
     if (target_layer == -999) return;
 
-    {
-        std::unique_lock<std::mutex> lock(g_gpu_io_mutex);
+    (void) next_layer_hint;
 
-        if (g_gpu_currently_loaded != target_layer) {
-            // Issue urgent load command if worker isn't already handling this layer
-            if (g_gpu_prefetch_target != target_layer &&
-                g_gpu_prefetch_done   != target_layer) {
-                g_gpu_prefetch_target = target_layer;
-                g_gpu_prefetch_done   = -999;
-                g_gpu_cv_worker.notify_all();
-            }
-
-            // Block until worker finishes loading
-            g_gpu_cv_main.wait(lock, [&]{
-                return g_gpu_prefetch_done == target_layer;
-            });
-
-            // Swap buffers: newly loaded becomes compute buffer
-            std::swap(g_gpu_compute_ptr, g_gpu_io_ptr);
-            g_gpu_currently_loaded = target_layer;
-        }
-    }
-
-    // Prefetch hint: tell worker to load next layer while we compute current
-    if (next_layer_hint != -999) {
-        std::unique_lock<std::mutex> lock(g_gpu_io_mutex);
-        if (g_gpu_prefetch_target == -999 &&
-            g_gpu_prefetch_done   != next_layer_hint) {
-            g_gpu_prefetch_target = next_layer_hint;
-            g_gpu_prefetch_done   = -999;
-            g_gpu_cv_worker.notify_all();
-        }
+    if (g_gpu_currently_loaded != target_layer) {
+        load_gpu_layer_sync(target_layer, g_gpu_compute_ptr);
+        g_gpu_currently_loaded = target_layer;
     }
 }
 
@@ -327,6 +375,8 @@ extern "C" void start_gpu_async_prefetch_engine(int device) {
     static bool started = false;
     if (started) return;
     started = true;
+    g_gpu_layer_device = device;
+    ggml_cuda_set_device(device);
 
     g_gpu_layer_buffer_size = get_max_gpu_layer_size();
     if (g_gpu_layer_buffer_size == 0) return;
@@ -337,7 +387,6 @@ extern "C" void start_gpu_async_prefetch_engine(int device) {
     g_gpu_compute_ptr = g_gpu_layer_buffer_A;
     g_gpu_io_ptr      = g_gpu_layer_buffer_B;
 
-    g_gpu_io_thread = new std::thread(gpu_io_worker_func);
     g_gpu_layer_mgmt_enabled = true;
 }
 
@@ -3911,7 +3960,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // ====== End Dynamic GPU Layer Loading ======
 
                 // start of fusion operations
-                static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
+                const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr || g_gpu_layer_mgmt_enabled;
                 if (!disable_fusion) {
                     ggml_cuda_topk_moe_args args;
 
@@ -4339,6 +4388,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // allocate GPU ping-pong buffers and start the I/O worker thread.
     if (getenv("GGML_CUDA_DYNAMIC_LAYERS") != nullptr && !g_gpu_layer_mgmt_enabled) {
         start_gpu_async_prefetch_engine(cuda_ctx->device);
+    }
+    if (g_gpu_layer_mgmt_enabled && g_my_layer_table[998].is_initialized) {
+        ensure_gpu_layer_loaded(998, get_next_layer(998));
+        void * tok_embd_addr = get_gpu_tensor_memory_by_name(998, "token_embd.weight");
+        if (tok_embd_addr != nullptr) {
+            int tok_embd_rebind_count = 0;
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                ggml_tensor * node = cgraph->nodes[i];
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (node->src[j] != nullptr && strcmp(node->src[j]->name, "token_embd.weight") == 0) {
+                        node->src[j]->data = tok_embd_addr;
+                        tok_embd_rebind_count++;
+                    }
+                }
+            }
+            GGML_UNUSED(tok_embd_rebind_count);
+        }
     }
 
     bool use_cuda_graph             = false;
@@ -5071,6 +5137,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_Q6_K:
                         return true;
                     default:
                         return false;

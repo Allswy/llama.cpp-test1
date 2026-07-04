@@ -75,3 +75,24 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.x *= d;
     v.y *= d;
 }
+
+static __device__ __forceinline__ float dequantize_q6_K_elem(const block_q6_K & x, const int i) {
+    const int ip  = i / 128;
+    const int ir  = i - 128*ip;
+    const int il  = ir & 31;
+    const int is  = 8*ip + il/16;
+    const int seg = ir / 32;
+
+    const uint8_t ql = x.ql[64*ip + il + 32*(seg & 1)];
+    const uint8_t qh = x.qh[32*ip + il];
+    const int q = ((seg < 2 ? (ql & 0x0f) : (ql >> 4)) | (((qh >> (2*seg)) & 3) << 4)) - 32;
+
+    return (float) x.d * x.scales[is + 2*seg] * q;
+}
+
+static __device__ __forceinline__ void dequantize_q6_K(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    v.x = dequantize_q6_K_elem(x[ib], iqs);
+    v.y = dequantize_q6_K_elem(x[ib], iqs + QK_K/2);
+}
